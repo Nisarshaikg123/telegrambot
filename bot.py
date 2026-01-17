@@ -1,7 +1,6 @@
 import os
 import shutil
 import asyncio
-import time
 import threading
 from urllib.parse import urlparse
 
@@ -18,15 +17,32 @@ from telegram.ext import (
     filters,
 )
 
-TOKEN = "8593572876:AAGHni07-8nfM24hQep-OF8Aev1VXgDaSEI"
+# =========================
+# CONFIG
+# =========================
 
-# FFmpeg is needed for merging formats and MP3 conversion
-if not shutil.which("ffmpeg"):
-    raise RuntimeError("FFmpeg not found in PATH. Install FFmpeg and add it to PATH.")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593572876:AAGHni07-8nfM24hQep-OF8Aev1VXgDaSEI").strip()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env var not set (Railway -> Variables -> BOT_TOKEN)")
 
-users = {}  # uid -> dict(lang, link, quality)
+# Don't crash if ffmpeg missing at startup
+FFMPEG_OK = bool(shutil.which("ffmpeg"))
 
-# ---------------- HELPERS ----------------
+# Use a writable directory (Windows Temp) to avoid permission issues
+DOWNLOAD_DIR = os.path.join(os.environ.get("TEMP", os.getcwd()), "telegrambot_downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+USER = {}  # uid -> {"lang": "hi"/"en", "link": str}
+QUALITIES = ["144", "240", "360", "480", "720", "1080"]
+
+# =========================
+# HELPERS
+# =========================
+
+def tr(uid: int, hi: str, en: str) -> str:
+    lang = USER.get(uid, {}).get("lang", "en")
+    return hi if lang == "hi" else en
 
 def is_instagram(url: str) -> bool:
     try:
@@ -35,69 +51,97 @@ def is_instagram(url: str) -> bool:
     except Exception:
         return False
 
-def safe_cleanup(prefix: str):
-    for f in os.listdir():
-        if f.startswith(prefix):
-            try:
-                os.remove(f)
-            except:
-                pass
+def clean_temp(prefix: str):
+    """Remove temp files inside DOWNLOAD_DIR starting with prefix."""
+    try:
+        for f in os.listdir(DOWNLOAD_DIR):
+            if f.startswith(prefix):
+                try:
+                    os.remove(os.path.join(DOWNLOAD_DIR, f))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-def t(uid: int, hi: str, en: str) -> str:
-    lang = users.get(uid, {}).get("lang", "en")
-    return hi if lang == "hi" else en
-
-def progress_bar(pct: float, width: int = 18) -> str:
+def bar(pct: float, width: int = 18) -> str:
     pct = max(0.0, min(100.0, pct))
     filled = int((pct / 100.0) * width)
     return "█" * filled + "░" * (width - filled)
 
-# ---------------- PROGRESS (NO WARNINGS) ----------------
+# =========================
+# UI MENUS
+# =========================
 
-class ProgressState:
+def menu_language() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🇮🇳 Hindi", callback_data="lang_hi"),
+         InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")]
+    ])
+
+def menu_format(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 MP3", callback_data="fmt_mp3"),
+         InlineKeyboardButton("🎬 MP4", callback_data="fmt_mp4")],
+        [InlineKeyboardButton(tr(uid, "🌐 भाषा बदलें", "🌐 Change language"), callback_data="go_lang")]
+    ])
+
+def menu_quality(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("144p", callback_data="q_144"),
+         InlineKeyboardButton("240p", callback_data="q_240"),
+         InlineKeyboardButton("360p", callback_data="q_360")],
+        [InlineKeyboardButton("480p", callback_data="q_480"),
+         InlineKeyboardButton("720p", callback_data="q_720"),
+         InlineKeyboardButton("1080p", callback_data="q_1080")],
+        [InlineKeyboardButton(tr(uid, "⬅️ पीछे", "⬅️ Back"), callback_data="back_fmt"),
+         InlineKeyboardButton(tr(uid, "🏠 Home", "🏠 Home"), callback_data="home")]
+    ])
+
+# =========================
+# PROGRESS (safe)
+# =========================
+
+class Prog:
     def __init__(self):
         self.lock = threading.Lock()
         self.text = None
         self.done = False
 
-def make_progress_hook(state: ProgressState, prefix: str):
+def make_hook(prog: Prog, prefix: str):
     def hook(d):
-        status = d.get("status")
-        if status == "downloading":
+        st = d.get("status")
+        if st == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes") or 0
-
-            if total and total > 0:
-                pct = (downloaded / total) * 100.0
-                bar = progress_bar(pct)
-                speed = d.get("speed") or 0
+            done = d.get("downloaded_bytes") or 0
+            if total:
+                pct = (done / total) * 100.0
                 eta = d.get("eta")
-
-                speed_txt = f" | {speed/1024/1024:.2f} MB/s" if speed else ""
-                eta_txt = f" | ETA {int(eta)}s" if isinstance(eta, (int, float)) else ""
-                msg = f"{prefix}\n{bar} {pct:.1f}%{speed_txt}{eta_txt}"
+                speed = d.get("speed") or 0
+                s_txt = f" | {speed/1024/1024:.2f} MB/s" if speed else ""
+                e_txt = f" | ETA {int(eta)}s" if isinstance(eta, (int, float)) else ""
+                txt = f"{prefix}\n{bar(pct)} {pct:.1f}%{s_txt}{e_txt}"
             else:
-                msg = f"{prefix}\nDownloading…"
+                txt = f"{prefix}\nDownloading…"
 
-            with state.lock:
-                state.text = msg
+            with prog.lock:
+                prog.text = txt
 
-        elif status == "finished":
-            with state.lock:
-                state.text = f"{prefix}\n✅ Download finished. Processing…"
+        elif st == "finished":
+            with prog.lock:
+                prog.text = f"{prefix}\n✅ Download finished. Processing…"
     return hook
 
-async def progress_poller(bot, chat_id: int, message_id: int, state: ProgressState):
-    last_sent = None
+async def poll_progress(bot, chat_id: int, msg_id: int, prog: Prog):
+    last = None
     while True:
-        with state.lock:
-            txt = state.text
-            done = state.done
+        with prog.lock:
+            t = prog.text
+            done = prog.done
 
-        if txt and txt != last_sent:
+        if t and t != last:
             try:
-                await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=txt)
-                last_sent = txt
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=t)
+                last = t
             except Exception:
                 pass
 
@@ -106,161 +150,138 @@ async def progress_poller(bot, chat_id: int, message_id: int, state: ProgressSta
 
         await asyncio.sleep(1.0)
 
-# ---------------- UI MENUS ----------------
+# =========================
+# HANDLERS
+# =========================
 
-def lang_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🇮🇳 Hindi", callback_data="lang_hi"),
-            InlineKeyboardButton("🇬🇧 English", callback_data="lang_en"),
-        ]
-    ])
-
-def format_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🎵 MP3", callback_data="mp3"),
-            InlineKeyboardButton("🎬 MP4", callback_data="mp4"),
-        ],
-        [InlineKeyboardButton("🏠 Home (Language)", callback_data="home")],
-    ])
-
-def quality_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("144p", callback_data="q_144"),
-            InlineKeyboardButton("240p", callback_data="q_240"),
-            InlineKeyboardButton("360p", callback_data="q_360"),
-        ],
-        [
-            InlineKeyboardButton("480p", callback_data="q_480"),
-            InlineKeyboardButton("720p HD", callback_data="q_720"),
-            InlineKeyboardButton("1080p FHD", callback_data="q_1080"),
-        ],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back_format"),
-         InlineKeyboardButton("🏠 Home", callback_data="home")],
-    ])
-
-# ---------------- HANDLERS ----------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    users.setdefault(uid, {})
+    USER.setdefault(uid, {})
 
-    # Language only first time
-    if "lang" in users[uid]:
-        await update.message.reply_text(t(uid, "🔗 Video link भेजो", "🔗 Send video link"))
+    # Ask language only first time
+    if "lang" not in USER[uid]:
+        await update.message.reply_text("🌐 Select Language / भाषा चुनें", reply_markup=menu_language())
     else:
-        await update.message.reply_text("🌐 Select Language / भाषा चुनें", reply_markup=lang_menu())
+        await update.message.reply_text(tr(uid, "🔗 वीडियो लिंक भेजो", "🔗 Send video link"))
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    users.setdefault(uid, {})
-    text = update.message.text.strip()
+    uid = update.effective_user.id
+    USER.setdefault(uid, {})
 
-    # If language not set yet, ask language (store link anyway)
-    if "lang" not in users[uid]:
-        users[uid]["link"] = text
-        await update.message.reply_text("🌐 Select Language / भाषा चुनें", reply_markup=lang_menu())
+    link = (update.message.text or "").strip()
+    if not link:
         return
 
-    # Every new text = new link; reset quality
-    users[uid]["link"] = text
-    users[uid].pop("quality", None)
+    # Store new link every time
+    USER[uid]["link"] = link
 
-    await update.message.reply_text(t(uid, "📥 Format चुनें", "📥 Choose format"), reply_markup=format_menu())
+    if "lang" not in USER[uid]:
+        await update.message.reply_text("🌐 Select Language / भाषा चुनें", reply_markup=menu_language())
+        return
+
+    await update.message.reply_text(tr(uid, "📥 Format चुनें", "📥 Choose format"), reply_markup=menu_format(uid))
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    users.setdefault(uid, {})
+    USER.setdefault(uid, {})
     data = q.data
 
-    # Home -> change language
-    if data == "home":
-        await q.edit_message_text("🌐 Change Language / भाषा बदलें", reply_markup=lang_menu())
+    if data == "go_lang":
+        await q.edit_message_text("🌐 Select Language / भाषा चुनें", reply_markup=menu_language())
         return
 
-    # Set language
     if data.startswith("lang_"):
-        users[uid]["lang"] = data.split("_")[1]
-        await q.edit_message_text(t(uid, "✅ Language set. अब video link भेजो 🔗",
-                                    "✅ Language set. Now send video link 🔗"))
+        USER[uid]["lang"] = data.split("_", 1)[1]
+        await q.edit_message_text(tr(uid, "✅ भाषा सेट हो गई! अब लिंक भेजो 🔗",
+                                     "✅ Language set! Now send link 🔗"))
         return
 
-    if data == "back_format":
-        await q.edit_message_text(t(uid, "📥 Format चुनें", "📥 Choose format"), reply_markup=format_menu())
+    if data == "home":
+        await q.edit_message_text(tr(uid, "🔗 वीडियो लिंक भेजो", "🔗 Send video link"))
         return
 
-    link = users[uid].get("link")
-    if data in ("mp3", "mp4") and not link:
-        await q.edit_message_text(t(uid, "⚠️ पहले video link भेजो", "⚠️ Send a video link first"))
+    if data == "back_fmt":
+        await q.edit_message_text(tr(uid, "📥 Format चुनें", "📥 Choose format"), reply_markup=menu_format(uid))
+        return
+
+    link = USER[uid].get("link", "").strip()
+    if not link:
+        await q.edit_message_text(tr(uid, "⚠️ पहले लिंक भेजो", "⚠️ Send a link first"))
         return
 
     # MP3
-    if data == "mp3":
+    if data == "fmt_mp3":
+        if not FFMPEG_OK:
+            await q.edit_message_text("❌ FFmpeg missing on server. Redeploy with ffmpeg enabled.")
+            return
+
         msg = await context.bot.send_message(
             chat_id=q.message.chat_id,
-            text=t(uid, "🎵 MP3 डाउनलोड शुरू…", "🎵 MP3 download started…")
+            text=tr(uid, "🎵 MP3 डाउनलोड शुरू…", "🎵 MP3 download started…")
         )
-        await download_mp3_with_progress(
-            url=link,
-            chat_id=q.message.chat_id,
-            context=context,
-            progress_message_id=msg.message_id,
-            uid=uid
-        )
-        await q.edit_message_text(t(uid, "✅ Done! नया link भेजो 🔗", "✅ Done! Send a new link 🔗"))
+        await download_mp3(link, q.message.chat_id, context, msg.message_id, uid)
+        await q.edit_message_text(tr(uid, "✅ Done! अगला लिंक भेजो 🔗", "✅ Done! Send next link 🔗"))
         return
 
-    # MP4 -> quality menu
-    if data == "mp4":
-        await q.edit_message_text(t(uid, "🎚 Quality चुनें", "🎚 Select quality"), reply_markup=quality_menu())
-        return
-
-    # Quality chosen -> download MP4 with progress
-    if data.startswith("q_"):
-        users[uid]["quality"] = data.split("_")[1]
-
-        prefix = t(uid, "🎬 MP4 डाउनलोड…", "🎬 MP4 downloading…")
+    # MP4: Instagram auto, others ask quality
+    if data == "fmt_mp4":
         if is_instagram(link):
-            prefix += t(uid, " (Instagram Auto quality)", " (Instagram Auto quality)")
+            if not FFMPEG_OK:
+                await q.edit_message_text("❌ FFmpeg missing on server. Redeploy with ffmpeg enabled.")
+                return
 
-        msg = await context.bot.send_message(chat_id=q.message.chat_id, text=prefix)
+            msg = await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=tr(uid, "🎬 Instagram MP4 (Auto) शुरू…", "🎬 Instagram MP4 (Auto) started…")
+            )
+            await download_mp4(link, None, q.message.chat_id, context, msg.message_id, uid)
+            await q.edit_message_text(tr(uid, "✅ Done! अगला लिंक भेजो 🔗", "✅ Done! Send next link 🔗"))
+            return
 
-        await download_mp4_with_progress(
-            url=link,
-            quality=users[uid]["quality"],
-            chat_id=q.message.chat_id,
-            context=context,
-            progress_message_id=msg.message_id,
-            uid=uid
-        )
-
-        await q.edit_message_text(t(uid, "✅ Done! नया link भेजो 🔗", "✅ Done! Send a new link 🔗"))
+        await q.edit_message_text(tr(uid, "🎚 Quality चुनें", "🎚 Select quality"), reply_markup=menu_quality(uid))
         return
 
-# ---------------- DOWNLOADS (WITH PROGRESS) ----------------
+    # Quality chosen
+    if data.startswith("q_"):
+        if not FFMPEG_OK:
+            await q.edit_message_text("❌ FFmpeg missing on server. Redeploy with ffmpeg enabled.")
+            return
 
-async def download_mp3_with_progress(url: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
-                                     progress_message_id: int, uid: int):
-    safe_cleanup("audio_")
+        qv = data.split("_", 1)[1]
+        if qv not in QUALITIES:
+            await q.edit_message_text("❌ Invalid quality")
+            return
 
-    state = ProgressState()
-    prefix = t(uid, "🎵 MP3 डाउनलोड…", "🎵 MP3 downloading…")
-    hook = make_progress_hook(state, prefix)
+        msg = await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=tr(uid, f"🎬 MP4 {qv}p डाउनलोड शुरू…", f"🎬 MP4 {qv}p download started…")
+        )
+        await download_mp4(link, qv, q.message.chat_id, context, msg.message_id, uid)
+        await q.edit_message_text(tr(uid, "✅ Done! अगला लिंक भेजो 🔗", "✅ Done! Send next link 🔗"))
+        return
 
-    poll_task = asyncio.create_task(progress_poller(context.bot, chat_id, progress_message_id, state))
+# =========================
+# DOWNLOADS
+# =========================
+
+async def download_mp3(url: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE, progress_msg_id: int, uid: int):
+    clean_temp("audio_")
+
+    prog = Prog()
+    prefix = tr(uid, "🎵 MP3 डाउनलोड…", "🎵 MP3 downloading…")
+    hook = make_hook(prog, prefix)
+    poll_task = asyncio.create_task(poll_progress(context.bot, chat_id, progress_msg_id, prog))
 
     def _run():
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": "audio_%(id)s.%(ext)s",
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+            "outtmpl": os.path.join(DOWNLOAD_DIR, "audio_%(id)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
             "progress_hooks": [hook],
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -268,50 +289,57 @@ async def download_mp3_with_progress(url: str, chat_id: int, context: ContextTyp
     try:
         await asyncio.to_thread(_run)
     except Exception:
-        with state.lock:
-            state.text = "❌ Download failed."
-            state.done = True
+        with prog.lock:
+            prog.text = "❌ Download failed."
+            prog.done = True
         await poll_task
         return
 
-    sent = False
-    for f in os.listdir():
+    mp3_file = None
+    for f in os.listdir(DOWNLOAD_DIR):
         if f.startswith("audio_") and f.endswith(".mp3"):
-            await context.bot.send_document(chat_id=chat_id, document=open(f, "rb"))
-            os.remove(f)
-            sent = True
+            mp3_file = f
             break
 
-    with state.lock:
-        state.text = t(uid, "✅ MP3 Ready!", "✅ MP3 Ready!") if sent else "❌ MP3 not found."
-        state.done = True
+    if not mp3_file:
+        with prog.lock:
+            prog.text = "❌ MP3 not found."
+            prog.done = True
+        await poll_task
+        return
 
+    full = os.path.join(DOWNLOAD_DIR, mp3_file)
+    await context.bot.send_document(chat_id=chat_id, document=open(full, "rb"))
+    os.remove(full)
+
+    with prog.lock:
+        prog.text = "✅ MP3 Ready!"
+        prog.done = True
     await poll_task
 
-async def download_mp4_with_progress(url: str, quality: str, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
-                                     progress_message_id: int, uid: int):
-    safe_cleanup("video_")
+async def download_mp4(url: str, quality: str | None, chat_id: int, context: ContextTypes.DEFAULT_TYPE,
+                       progress_msg_id: int, uid: int):
+    clean_temp("video_")
 
-    if is_instagram(url):
-        format_fallbacks = ["best", "b"]
-        prefix = t(uid, "🎬 MP4 डाउनलोड… (Auto quality)", "🎬 MP4 downloading… (Auto quality)")
+    prog = Prog()
+    prefix = tr(uid, "🎬 MP4 डाउनलोड…", "🎬 MP4 downloading…")
+    hook = make_hook(prog, prefix)
+    poll_task = asyncio.create_task(poll_progress(context.bot, chat_id, progress_msg_id, prog))
+
+    if is_instagram(url) or not quality:
+        formats = ["best", "b"]
     else:
-        format_fallbacks = [
+        formats = [
             f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
             f"best[height<={quality}]",
             "best",
         ]
-        prefix = t(uid, "🎬 MP4 डाउनलोड…", "🎬 MP4 downloading…")
 
-    state = ProgressState()
-    hook = make_progress_hook(state, prefix)
-    poll_task = asyncio.create_task(progress_poller(context.bot, chat_id, progress_message_id, state))
-
-    def _try_download(fmt: str):
+    def _try(fmt: str):
         ydl_opts = {
             "format": fmt,
             "merge_output_format": "mp4",
-            "outtmpl": "video_%(id)s.%(ext)s",
+            "outtmpl": os.path.join(DOWNLOAD_DIR, "video_%(id)s.%(ext)s"),
             "noplaylist": True,
             "quiet": True,
             "progress_hooks": [hook],
@@ -320,9 +348,9 @@ async def download_mp4_with_progress(url: str, quality: str, chat_id: int, conte
             ydl.download([url])
 
     ok = False
-    for fmt in format_fallbacks:
+    for fmt in formats:
         try:
-            await asyncio.to_thread(_try_download, fmt)
+            await asyncio.to_thread(_try, fmt)
             ok = True
             break
         except DownloadError:
@@ -331,49 +359,71 @@ async def download_mp4_with_progress(url: str, quality: str, chat_id: int, conte
             continue
 
     if not ok:
-        with state.lock:
-            state.text = "❌ Download failed. Try another public link."
-            state.done = True
+        with prog.lock:
+            prog.text = "❌ Download failed. Try another public link."
+            prog.done = True
         await poll_task
         return
 
     mp4_file = None
-    for f in os.listdir():
+    for f in os.listdir(DOWNLOAD_DIR):
         if f.startswith("video_") and f.endswith(".mp4"):
             mp4_file = f
             break
 
     if not mp4_file:
-        with state.lock:
-            state.text = "❌ Failed to create MP4."
-            state.done = True
+        with prog.lock:
+            prog.text = "❌ MP4 not created."
+            prog.done = True
         await poll_task
         return
 
-    await context.bot.send_video(chat_id=chat_id, video=open(mp4_file, "rb"))
-    os.remove(mp4_file)
-
-    with state.lock:
-        state.text = t(uid, "✅ MP4 Ready!", "✅ MP4 Ready!")
-        state.done = True
-
+    full = os.path.join(DOWNLOAD_DIR, mp4_file)
+    try:
+     await context.bot.send_video(chat_id=chat_id, video=open(full, "rb"))
+    except Exception:
+     await context.bot.send_message(
+        chat_id=chat_id,
+        text="❌ Upload failed (timeout). Video file bahut bada ho sakta hai ya internet slow hai. Chhoti quality try karo."
+    )
+    try:
+        os.remove(full)
+    except Exception:
+        pass
+    with prog.lock:
+        prog.text = "❌ Upload timed out."
+        prog.done = True
     await poll_task
-
-# ---------------- ERROR HANDLER ----------------
-
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     return
 
-# ---------------- MAIN ----------------
+    os.remove(full)
+
+    with prog.lock:
+        prog.text = "✅ MP4 Ready!"
+        prog.done = True
+    await poll_task
+
+# =========================
+# MAIN
+# =========================
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(CallbackQueryHandler(on_button))
-    app.add_error_handler(on_error)
-    print("✅ Bot running (Progress % enabled, no warnings)")
-    app.run_polling()
+   app = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .read_timeout(180)
+    .write_timeout(180)
+    .connect_timeout(60)
+    .pool_timeout(60)
+    .build()
+    )
+
+   app.add_handler(CommandHandler("start", cmd_start))
+   app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+   app.add_handler(CallbackQueryHandler(on_button))
+
+   print("✅ Bot running")
+   app.run_polling()
 
 if __name__ == "__main__":
     main()
